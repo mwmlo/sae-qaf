@@ -2,6 +2,8 @@ import requests
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import List, Tuple
+import requests
 
 
 def get_latent_features(base_activation, sae):
@@ -16,7 +18,7 @@ def get_latent_features(base_activation, sae):
   return acts_idxs
 
 
-def get_explanations(feature_index, layer_index):
+def _retrieve_neuronpedia(layer_index, feature_index):
   url = f"https://www.neuronpedia.org/api/feature/gpt2-small/{layer_index}-mlp-oai/{feature_index}"
   headers = {
     'Accept': 'application/json',
@@ -26,8 +28,12 @@ def get_explanations(feature_index, layer_index):
     response = requests.get(url, headers=headers)
   except:
     return [], []
+  
+  return response.json()
 
-  response = response.json()
+
+def get_explanations(feature_index, layer_index):
+  response = _retrieve_neuronpedia(feature_index, layer_index)
   descriptions = []
   explanations = response.get('explanations')
   for e in explanations:
@@ -114,3 +120,59 @@ def cluster_activations_for_prompt(model, prev_layer_loc, concept_tokens, sparx_
 
   top_activating_clusters = [list(np.where(acts > 1.0)[0]) for acts in hidden_cluster_acts]
   return top_activating_clusters
+
+
+def get_top_activating_prompts_for_latent_feature(layer_index, feature_index: int) -> Tuple[List[str], List[str]]:
+  response = _retrieve_neuronpedia(layer_index, feature_index)
+
+  descriptions = []
+  explanations = response.get('explanations')
+  for e in explanations:
+    descriptions.append(e['description'])
+
+  # Get top five activating prompts: context window +-3 tokens around top activating token
+  prompts = []
+  top_samples = response.get('activations')[:5]
+  for sample in top_samples:
+    max_value_token_index = sample['maxValueTokenIndex']
+    prompt_tokens = sample['tokens'][max_value_token_index-3:max_value_token_index+4]
+    prompts.append(''.join(prompt_tokens))
+
+  return (descriptions, prompts)
+
+
+def get_top_clusters_for_prompts(model, prev_layer_loc, prompts: List[str], sparx_model) -> List[List[int]]:
+  concept_logits, concept_cache = model.run_with_cache(prompts)
+  concept_acts = concept_cache[prev_layer_loc][:,-1].numpy().reshape(-1, 768)
+
+  sparx_model.forward_pass(concept_acts)
+  # Get cluster-neuron activations in MLP hidden layer
+  prompt_cluster_acts = sparx_model.forward_pass_data[0]
+
+  top_activating_clusters_per_prompt = [list(np.where(prompt_acts > 1.0)[0]) for prompt_acts in prompt_cluster_acts]
+  return top_activating_clusters_per_prompt
+
+
+def measure_similarity_in_activated_clusters(top_clusters: List[List[int]]) -> List[List[float]]:
+  n_prompts = len(top_clusters)
+  prompt_cluster_sim = [[0.0] * n_prompts for _ in range(n_prompts)]
+
+  for i in range(n_prompts):
+    for j in range(i, n_prompts):
+      clusters_a = top_clusters[i]
+      clusters_b = top_clusters[j]
+      print(clusters_a, clusters_b)
+      sim = calculate_similarity(clusters_a, clusters_b)
+      prompt_cluster_sim[i][j] = sim
+      prompt_cluster_sim[j][i] = sim
+
+  return prompt_cluster_sim
+
+
+def list_explanations_for_single_activation(activation, autoencoder):
+  with torch.no_grad():
+    exps = get_latent_features(activation, autoencoder)
+
+  for act, idx in exps[:5]:
+    descriptions, max_tokens = get_explanations(idx)
+    print(f"Latent feature {idx}: {descriptions}; {max_tokens}")
