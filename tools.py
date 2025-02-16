@@ -3,13 +3,10 @@ import tensorflow as tf
 from keras.models import Sequential
 from keras.layers import Dense
 from SpArX.sparx import FFNN, KMeansClusterer, GlobalMerger, LocalMerger
+import sparse_autoencoder
+import blobfile as bf
+import torch
 
-import transformer_lens.utils as utils
-from transformer_lens import ActivationCache, HookedTransformer
-
-from datasets import load_dataset
-from transformer_lens.utils import tokenize_and_concatenate
-from sae_lens import SAE
 
 def extract_mlp(model, layer_index: int):
     """
@@ -44,13 +41,19 @@ def extract_mlp(model, layer_index: int):
     return mlp
 
 
-def shrink_model(original_model, shrink_percentage):
+def shrink_model_global(original_model, shrink_percentage):
   cluster_labels = KMeansClusterer.cluster(original_model, shrink_percentage)
   merged_model = GlobalMerger.merge(original_model, cluster_labels)
   return merged_model, cluster_labels
 
 
-def sparsify_mlp(mlp, ds_acts, shrink_pcs = [0.1, 0.3, 0.5, 0.7, 0.9]):
+def shrink_model_local(original_model, shrink_percentage):
+  cluster_labels = KMeansClusterer.cluster(original_model, shrink_percentage)
+  merged_model = LocalMerger.merge(original_model, cluster_labels)
+  return merged_model, cluster_labels
+
+
+def get_original_mlp_for_sparx(mlp, ds_acts):
     shape = (768, 768*4, 768)
     weights = [layer.get_weights()[0] for layer in mlp.layers]
     bias = [layer.get_weights()[1] for layer in mlp.layers]
@@ -58,13 +61,21 @@ def sparsify_mlp(mlp, ds_acts, shrink_pcs = [0.1, 0.3, 0.5, 0.7, 0.9]):
 
     restored_model = FFNN(shape, weights, bias, activations)
     restored_model.forward_pass(ds_acts)
+    return restored_model
 
-    merged_models = []
-    models_cluster_labels = []
-    for pc in shrink_pcs:
-        model, labels = shrink_model(restored_model, pc)
-        model.model.summary()
-        merged_models.append(model)
-        models_cluster_labels.append(labels)
 
-    return merged_models, models_cluster_labels
+def output_infidelity(x, y):
+    return np.linalg.norm(x - y)/len(x)
+
+def output_mse(x, y):
+  return ((x - y)**2).mean()
+
+def output_r2(x, y):
+  return 1 - (((x-y)**2).mean() / np.var(y))
+
+
+def get_sparse_autoencoder(location, layer_index):
+    with bf.BlobFile(sparse_autoencoder.paths.v4(location, layer_index), mode="rb") as f:
+        state_dict = torch.load(f)
+        autoencoder = sparse_autoencoder.Autoencoder.from_state_dict(state_dict)
+        return autoencoder
